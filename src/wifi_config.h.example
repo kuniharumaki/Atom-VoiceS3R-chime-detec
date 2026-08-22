@@ -1,0 +1,11 @@
+#pragma once
+
+// Wi-Fi接続情報
+const char *WIFI_SSID = "YOUR_WIFI_SSID";
+const char *WIFI_PASS = "YOUR_WIFI_PASSWORD";
+
+// MQTT接続情報
+const char *MQTT_SERVER = "192.168.1.100"; // ブローカーのIPアドレス
+const int MQTT_PORT = 1883;
+const char *MQTT_TOPIC = "home/sensors/intercom/state";
+const char *DEVICE_ID = "atom_voice_intercom";
