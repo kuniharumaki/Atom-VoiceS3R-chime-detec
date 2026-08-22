@@ -51,6 +51,8 @@ M5Stack Atom VoiceS3R を使用して、インターホンのチャイム音（�
    const char *MQTT_SERVER = "192.168.x.x"; // ブローカーのIPアドレス
    const int MQTT_PORT = 1883;
    const char *MQTT_TOPIC = "home/sensors/intercom/state";
+   const char *MQTT_TOPIC_STATUS = "home/sensors/intercom/status";
+   const char *MQTT_TOPIC_TELEMETRY = "home/sensors/intercom/telemetry";
    const char *DEVICE_ID = "atom_voice_intercom";
    ```
 
@@ -61,7 +63,9 @@ M5Stack Atom VoiceS3R を使用して、インターホンのチャイム音（�
    ```
 
 ## MQTT ペイロード仕様
-チャイムを検知すると、以下のような JSON が送信されます。
+
+### チャイム検知 (state)
+チャイムを検知すると、指定した `MQTT_TOPIC` へ以下の JSON が送信されます。
 ```json
 {
   "event": "chime_detected",
@@ -71,3 +75,18 @@ M5Stack Atom VoiceS3R を使用して、インターホンのチャイム音（�
 }
 ```
 ※ `type` は `"Genkan"` または `"Entrance"` になります。
+
+### 接続ステータス (status)
+デバイスの接続状態を `MQTT_TOPIC_STATUS` へ送信します。
+- 接続時 (Birth Message): `online` (Retain: true)
+- 異常切断時 (LWT): `offline` (Retain: true)
+
+### テレメトリー / ハートビート (telemetry)
+5分に1回、`MQTT_TOPIC_TELEMETRY` へデバイス状態の JSON が送信されます。
+```json
+{
+  "uptime": 300,
+  "rssi": -55,
+  "free_heap": 204800
+}
+```

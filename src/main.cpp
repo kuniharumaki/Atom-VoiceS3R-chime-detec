@@ -452,8 +452,11 @@ void reconnectMQTT() {
         if (millis() - lastReconnectAttempt > 5000) {
             lastReconnectAttempt = millis();
             Serial.print("[MQTT] Attempting connection...");
-            if (mqttClient.connect(DEVICE_ID)) {
+            // LWT設定: QoS 0, Retain true, Payload "offline"
+            if (mqttClient.connect(DEVICE_ID, MQTT_TOPIC_STATUS, 0, true, "offline")) {
                 Serial.println("connected");
+                // 接続成功時に Birth Message (online) を Retain true で送信
+                mqttClient.publish(MQTT_TOPIC_STATUS, "online", true);
             } else {
                 Serial.print("failed, rc=");
                 Serial.println(mqttClient.state());
@@ -479,6 +482,22 @@ void loop() {
                     Serial.println("[MQTT] Message Published: " + payload);
                 } else {
                     Serial.println("[MQTT] Message Publish Failed!");
+                }
+            }
+
+            // テレメトリー (ハートビート) の定期送信 (5分=300000ms毎)
+            static unsigned long lastTelemetryTime = 0;
+            if (millis() - lastTelemetryTime > 300000) {
+                lastTelemetryTime = millis();
+                unsigned long uptimeSec = millis() / 1000;
+                long rssi = WiFi.RSSI();
+                uint32_t freeHeap = ESP.getFreeHeap();
+
+                String telemetryPayload = "{\"uptime\":" + String(uptimeSec) + ",\"rssi\":" + String(rssi) + ",\"free_heap\":" + String(freeHeap) + "}";
+                if (mqttClient.publish(MQTT_TOPIC_TELEMETRY, telemetryPayload.c_str())) {
+                    Serial.println("[MQTT] Telemetry Published: " + telemetryPayload);
+                } else {
+                    Serial.println("[MQTT] Telemetry Publish Failed!");
                 }
             }
         }
