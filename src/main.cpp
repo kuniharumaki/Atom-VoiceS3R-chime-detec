@@ -84,9 +84,10 @@ static int g_consecutiveDing = 0;
 static int g_consecutiveDong = 0;
 static int g_missCount = 0;
 
-static constexpr float AMP_THRESHOLD = 3000.0f; 
+static constexpr float AMP_THRESHOLD = 15000.0f; // ユーザー指定 (5000 -> 15000)
 static constexpr int MIN_CHUNKS = 4;
 static constexpr int MAX_MISS_TOLERANCE = 4;
+static constexpr int MAX_STATE_CHUNKS = 24; // 約1.5秒のタイムアウト
 
 // ============================================================
 // I2S 録音タスク
@@ -205,11 +206,32 @@ void monitorTask(void *pvParameters) {
                     if (vReal[i] > dongMax) dongMax = vReal[i];
                 }
 
-                // 純音成分が全体のスペクトルピークに対して十分に大きいか判定 (ピークの30%以上)
-                // バックグラウンドノイズでの誤検知を防ぐため、絶対値の閾値（例: 10000.0）も設ける
-                double magThreshold = max(peakMag * 0.3, 10000.0);
-                if (dingMax > magThreshold) isDing = true;
-                if (dongMax > magThreshold) isDong = true;
+                // --- 局所的なノイズフロアの算出 ---
+                // Ding周辺: 562〜609Hz(36-39) & 703〜796Hz(45-51)
+                double dingNoiseSum = 0;
+                for (int i = 36; i <= 39; i++) dingNoiseSum += vReal[i];
+                for (int i = 45; i <= 51; i++) dingNoiseSum += vReal[i];
+                double dingNoiseAvg = dingNoiseSum / 11.0;
+
+                // Dong周辺: 406〜453Hz(26-29) & 562〜609Hz(36-39)
+                double dongNoiseSum = 0;
+                for (int i = 26; i <= 29; i++) dongNoiseSum += vReal[i];
+                for (int i = 36; i <= 39; i++) dongNoiseSum += vReal[i];
+                double dongNoiseAvg = dongNoiseSum / 8.0;
+
+                // --- 判定条件 ---
+                // 1. 絶対閾値 (ユーザー指定: 15000.0)
+                double magThreshold = 15000.0;
+                
+                // 2. 局所S/N比 & 排他性
+                // Ding: 絶対値クリア AND 周辺ノイズの2倍以上 AND Dong帯域よりも1.5倍以上大きい
+                if (dingMax > magThreshold && dingMax > dingNoiseAvg * 2.0 && dingMax > dongMax * 1.5) {
+                    isDing = true;
+                }
+                // Dong: 絶対値クリア AND 周辺ノイズの2倍以上 AND Ding帯域よりも1.5倍以上大きい
+                if (dongMax > magThreshold && dongMax > dongNoiseAvg * 2.0 && dongMax > dingMax * 1.5) {
+                    isDong = true;
+                }
             } else {
                 g_currentFreq = 0.0f;
             }
@@ -243,6 +265,10 @@ void monitorTask(void *pvParameters) {
                     } else if (isDing) {
                         g_consecutiveDing++;
                         g_missCount = 0;
+                        if (g_consecutiveDing > MAX_STATE_CHUNKS) { // タイムアウト
+                            g_detectState = STATE_IDLE;
+                            g_statusText = "IDLE (Timeout)";
+                        }
                     } else {
                         g_missCount++;
                         if (g_missCount > MAX_MISS_TOLERANCE || g_currentAmp < AMP_THRESHOLD) {
@@ -256,6 +282,10 @@ void monitorTask(void *pvParameters) {
                     if (isDong) {
                         g_consecutiveDong++;
                         g_missCount = 0;
+                        if (g_consecutiveDong > MAX_STATE_CHUNKS) { // タイムアウト
+                            g_detectState = STATE_IDLE;
+                            g_statusText = "IDLE (Timeout)";
+                        }
                     } else {
                         g_missCount++;
                         if (g_missCount > MAX_MISS_TOLERANCE || g_currentAmp < AMP_THRESHOLD) {
@@ -268,6 +298,7 @@ void monitorTask(void *pvParameters) {
                                     g_lastChime = "Entrance";
                                 }
                                 g_lastDetectTime = millis();
+                                g_lastBtnPressTime = millis(); // 状況確認しやすくするため、検知時もOLEDを30秒点灯
                                 g_statusText = "IDLE";
                                 Serial.printf("=== CHIME DETECTED: %s (Ding:%d, Dong:%d) ===\n", g_lastChime.c_str(), g_consecutiveDing, g_consecutiveDong);
                                 
