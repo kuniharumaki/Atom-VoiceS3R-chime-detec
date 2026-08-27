@@ -58,6 +58,8 @@ static String g_statusText = "IDLE";
 static unsigned long g_lastDetectTime = 0;
 static int g_chimeCount = 0;
 static String g_lastChime = "None";
+static float g_lastDetectMaxAmp = 0.0f;
+static float g_currentDetectMaxAmp = 0.0f;
 
 // MQTT送信用フラグ
 static volatile bool g_pendingPublish = false;
@@ -76,18 +78,22 @@ static unsigned long g_lastBtnPressTime = 0;
 enum DetectState {
     STATE_IDLE,
     STATE_DETECTING_DING,
-    STATE_DETECTING_DONG
+    STATE_DETECTING_DONG,
+    STATE_WAIT_DING_2
 };
 
 static DetectState g_detectState = STATE_IDLE;
 static int g_consecutiveDing = 0;
 static int g_consecutiveDong = 0;
 static int g_missCount = 0;
+static unsigned long g_firstDingTime = 0;
 
 static constexpr float AMP_THRESHOLD = 15000.0f; // ユーザー指定 (5000 -> 15000)
-static constexpr int MIN_CHUNKS = 4;
-static constexpr int MAX_MISS_TOLERANCE = 4;
-static constexpr int MAX_STATE_CHUNKS = 24; // 約1.5秒のタイムアウト
+const float AMP_THRESHOLD_START = 15000.0f;
+const float AMP_THRESHOLD_CONTINUE = 8000.0f;
+const int MIN_CHUNKS = 4;
+const int MAX_MISS_TOLERANCE = 4;
+const int MAX_STATE_CHUNKS = 40; // 約1.5秒のタイムアウト
 
 // ============================================================
 // I2S 録音タスク
@@ -236,15 +242,39 @@ void monitorTask(void *pvParameters) {
                 g_currentFreq = 0.0f;
             }
             
+            if (g_detectState != STATE_IDLE && g_currentAmp > g_currentDetectMaxAmp) {
+                g_currentDetectMaxAmp = g_currentAmp;
+            }
+            
+            auto triggerDetection = [&]() {
+                g_chimeCount++;
+                unsigned long interval = millis() - g_firstDingTime;
+                if (interval > 2000) {
+                    g_lastChime = "Genkan";
+                } else {
+                    g_lastChime = "Entrance";
+                }
+                g_lastDetectTime = millis();
+                g_lastBtnPressTime = millis();
+                g_lastDetectMaxAmp = g_currentDetectMaxAmp;
+                g_statusText = "IDLE";
+                Serial.printf("=== CHIME DETECTED: %s (Interval:%lu ms, MaxAmp:%.0f) ===\n", g_lastChime.c_str(), interval, g_lastDetectMaxAmp);
+                g_publishType = g_lastChime;
+                g_pendingPublish = true;
+                g_detectState = STATE_IDLE;
+            };
+
             switch (g_detectState) {
                 case STATE_IDLE:
                     if (millis() - g_lastDetectTime < 3000) {
                         break; // 3秒間は再検知しない (反響や2回目の鳴動による上書き防止)
                     }
-                    if (isDing && g_currentAmp >= AMP_THRESHOLD) {
+                    if (isDing && g_currentAmp >= AMP_THRESHOLD_START) {
                         g_detectState = STATE_DETECTING_DING;
+                        g_firstDingTime = millis();
                         g_consecutiveDing = 1;
                         g_missCount = 0;
+                        g_currentDetectMaxAmp = g_currentAmp;
                         g_statusText = "Detecting DING";
                     }
                     break;
@@ -271,7 +301,7 @@ void monitorTask(void *pvParameters) {
                         }
                     } else {
                         g_missCount++;
-                        if (g_missCount > MAX_MISS_TOLERANCE || g_currentAmp < AMP_THRESHOLD) {
+                        if (g_missCount > MAX_MISS_TOLERANCE || g_currentAmp < AMP_THRESHOLD_CONTINUE) {
                             g_detectState = STATE_IDLE;
                             g_statusText = "IDLE";
                         }
@@ -279,6 +309,10 @@ void monitorTask(void *pvParameters) {
                     break;
 
                 case STATE_DETECTING_DONG:
+                    if (isDing && g_consecutiveDong >= MIN_CHUNKS && g_currentAmp >= AMP_THRESHOLD_CONTINUE) {
+                        triggerDetection();
+                        break;
+                    }
                     if (isDong) {
                         g_consecutiveDong++;
                         g_missCount = 0;
@@ -288,28 +322,24 @@ void monitorTask(void *pvParameters) {
                         }
                     } else {
                         g_missCount++;
-                        if (g_missCount > MAX_MISS_TOLERANCE || g_currentAmp < AMP_THRESHOLD) {
+                        if (g_missCount > MAX_MISS_TOLERANCE || g_currentAmp < AMP_THRESHOLD_CONTINUE) {
                             if (g_consecutiveDong >= MIN_CHUNKS) {
-                                // 検知成功！
-                                g_chimeCount++;
-                                if (g_consecutiveDing + g_consecutiveDong >= 20) {
-                                    g_lastChime = "Genkan";
-                                } else {
-                                    g_lastChime = "Entrance";
-                                }
-                                g_lastDetectTime = millis();
-                                g_lastBtnPressTime = millis(); // 状況確認しやすくするため、検知時もOLEDを30秒点灯
-                                g_statusText = "IDLE";
-                                Serial.printf("=== CHIME DETECTED: %s (Ding:%d, Dong:%d) ===\n", g_lastChime.c_str(), g_consecutiveDing, g_consecutiveDong);
-                                
-                                // MQTT送信フラグを立てる
-                                g_publishType = g_lastChime;
-                                g_pendingPublish = true;
+                                g_detectState = STATE_WAIT_DING_2;
+                                g_statusText = "Waiting DING 2";
                             } else {
+                                g_detectState = STATE_IDLE;
                                 g_statusText = "IDLE";
                             }
-                            g_detectState = STATE_IDLE;
                         }
+                    }
+                    break;
+
+                case STATE_WAIT_DING_2:
+                    if (millis() - g_firstDingTime > 6000) { // 6秒待っても来ない場合はタイムアウト
+                        g_detectState = STATE_IDLE;
+                        g_statusText = "IDLE (Timeout)";
+                    } else if (isDing && g_currentAmp >= AMP_THRESHOLD_CONTINUE) {
+                        triggerDetection();
                     }
                     break;
             }
@@ -359,24 +389,24 @@ void oledDisplayTask(void *pvParameters) {
         if (millis() - g_lastDetectTime < 5000 && g_lastDetectTime > 0) {
             canvas.setTextColor(TFT_WHITE);
             canvas.setTextSize(2);
-            canvas.setCursor(0, 26);
+            canvas.setCursor(0, 24);
             canvas.print(g_lastChime);
         } else {
             canvas.setTextColor(TFT_WHITE);
             canvas.setTextSize(1);
-            canvas.setCursor(0, 26);
+            canvas.setCursor(0, 24);
             canvas.printf("State: %s", g_statusText.c_str());
-            canvas.setCursor(0, 36);
+            canvas.setCursor(0, 34);
             canvas.printf("Last : %s", g_lastChime.c_str());
         }
 
         // リアルタイム情報
         canvas.setTextColor(TFT_WHITE);
         canvas.setTextSize(1);
-        canvas.setCursor(0, 48);
+        canvas.setCursor(0, 44);
         canvas.printf("Freq: %4.0f Hz", g_currentFreq);
-        canvas.setCursor(0, 58);
-        canvas.printf("Amp:  %4.0f", g_currentAmp);
+        canvas.setCursor(0, 54);
+        canvas.printf("Amp: %.0f M:%.0f", g_currentAmp, g_lastDetectMaxAmp);
 
         canvas.pushSprite(0, 0);
     }
