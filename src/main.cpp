@@ -91,6 +91,7 @@ static unsigned long g_firstDingTime = 0;
 static constexpr float AMP_THRESHOLD = 15000.0f; // ユーザー指定 (5000 -> 15000)
 const float AMP_THRESHOLD_START = 15000.0f;
 const float AMP_THRESHOLD_CONTINUE = 8000.0f;
+const float AMP_THRESHOLD_DING2 = 12000.0f;
 const int MIN_CHUNKS = 4;
 const int MAX_MISS_TOLERANCE = 4;
 const int MAX_STATE_CHUNKS = 40; // 約1.5秒のタイムアウト
@@ -309,9 +310,11 @@ void monitorTask(void *pvParameters) {
                     break;
 
                 case STATE_DETECTING_DONG:
-                    if (isDing && g_consecutiveDong >= MIN_CHUNKS && g_currentAmp >= AMP_THRESHOLD_CONTINUE) {
-                        triggerDetection();
-                        break;
+                    if (isDing && g_consecutiveDong >= MIN_CHUNKS && g_currentAmp >= AMP_THRESHOLD_DING2) {
+                        if (millis() - g_firstDingTime > 500) {
+                            triggerDetection();
+                            break;
+                        }
                     }
                     if (isDong) {
                         g_consecutiveDong++;
@@ -338,8 +341,10 @@ void monitorTask(void *pvParameters) {
                     if (millis() - g_firstDingTime > 6000) { // 6秒待っても来ない場合はタイムアウト
                         g_detectState = STATE_IDLE;
                         g_statusText = "IDLE (Timeout)";
-                    } else if (isDing && g_currentAmp >= AMP_THRESHOLD_CONTINUE) {
-                        triggerDetection();
+                    } else if (isDing && g_currentAmp >= AMP_THRESHOLD_DING2) {
+                        if (millis() - g_firstDingTime > 500) {
+                            triggerDetection();
+                        }
                     }
                     break;
             }
