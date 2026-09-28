@@ -1,12 +1,34 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <time.h>
 #include <M5EchoBase.h>
 #include <M5UnitOLED.h>
 #include <arduinoFFT.h>
 #include <PubSubClient.h>
-#include "wifi_config.h" // WIFI_SSID, WIFI_PASS, MQTT_SERVER, MQTT_PORT, MQTT_TOPIC, DEVICE_ID
+#include "wifi_config.h" // WIFI_SSID, WIFI_PASS, MQTT_SERVER, MQTT_PORT, MQTT_TOPIC, DEVICE_ID, NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY
 #include <esp_task_wdt.h>
+
+// ============================================================
+// NTP & 時刻同期設定
+// ============================================================
+static const long GMT_OFFSET_SEC = 9 * 3600; // JST (UTC+9)
+static const int DAYLIGHT_OFFSET_SEC = 0;
+
+// 現在日時フォーマット取得ヘルパー (YYYY-MM-DD HH:MM:SS)
+String getFormattedDateTime() {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 100)) {
+        char buf[32];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+        return String(buf);
+    }
+    // NTP同期前の場合、Uptimeで代替
+    unsigned long s = millis() / 1000;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Uptime %02lu:%02lu:%02lu", (s / 3600), (s % 3600) / 60, s % 60);
+    return String(buf);
+}
 
 // ============================================================
 // ハードウェアピン定義
@@ -40,7 +62,8 @@ static constexpr size_t RING_BUFFER_SAMPLES = 8192; // 解析用の一時バッ�
 struct ChimeLogEntry {
     uint32_t id;
     uint32_t uptimeSec;
-    char timeStr[16];           // "HH:MM:SS" 形式 (起動時からの相対時間)
+    char datetimeStr[32];       // "YYYY-MM-DD HH:MM:SS" (NTP未同期時は "Uptime HH:MM:SS")
+    char timeStr[16];           // "HH:MM:SS" (Uptime)
     char result[12];            // "Entrance" または "Genkan"
     char reason[64];            // 判定理由詳細
     uint32_t totalDurationMs;   // 1打目Ding開始から判定確定までの時間
@@ -316,10 +339,6 @@ void monitorTask(void *pvParameters) {
                 unsigned long totalDuration = millis() - g_firstDingTime;
                 unsigned long intervalDing2 = (g_ding2StartTime > 0) ? (g_ding2StartTime - g_firstDingTime) : 0;
 
-                Serial.printf("=== CHIME DETECTED: %s ===\n", g_lastChime.c_str());
-                Serial.printf("  Reason: %s\n", reason);
-                Serial.printf("  Duration: %lu ms, Ding2 Interval: %lu ms, MaxAmp: %.0f\n", totalDuration, intervalDing2, g_lastDetectMaxAmp);
-
                 // チューニング用ログ保存
                 ChimeLogEntry entry;
                 memset(&entry, 0, sizeof(entry));
@@ -327,6 +346,14 @@ void monitorTask(void *pvParameters) {
                 entry.uptimeSec = millis() / 1000;
                 uint32_t s = entry.uptimeSec;
                 snprintf(entry.timeStr, sizeof(entry.timeStr), "%02lu:%02lu:%02lu", (s / 3600), (s % 3600) / 60, s % 60);
+                String dtStr = getFormattedDateTime();
+                strncpy(entry.datetimeStr, dtStr.c_str(), sizeof(entry.datetimeStr) - 1);
+
+                Serial.printf("=== CHIME DETECTED: %s ===\n", g_lastChime.c_str());
+                Serial.printf("  Time: %s (Uptime: %s)\n", entry.datetimeStr, entry.timeStr);
+                Serial.printf("  Reason: %s\n", reason);
+                Serial.printf("  Duration: %lu ms, Ding2 Interval: %lu ms, MaxAmp: %.0f\n", totalDuration, intervalDing2, g_lastDetectMaxAmp);
+
                 strncpy(entry.result, chimeType, sizeof(entry.result) - 1);
                 strncpy(entry.reason, reason, sizeof(entry.reason) - 1);
                 entry.totalDurationMs = totalDuration;
@@ -628,8 +655,10 @@ void setupWebServer() {
         unsigned long upSec = millis() / 1000;
         char upStr[32];
         snprintf(upStr, sizeof(upStr), "%02luh %02lum %02lus", upSec / 3600, (upSec % 3600) / 60, upSec % 60);
+        String curTimeStr = getFormattedDateTime();
         
         html += "<div class=\"grid\">";
+        html += "<div class=\"card\"><div class=\"card-title\">Current Time (JST)</div><div class=\"card-val\" style=\"font-size:1.05rem;\">" + curTimeStr + "</div></div>";
         html += "<div class=\"card\"><div class=\"card-title\">IP Address</div><div class=\"card-val\">" + g_ipAddress + "</div></div>";
         html += "<div class=\"card\"><div class=\"card-title\">Uptime</div><div class=\"card-val\">" + String(upStr) + "</div></div>";
         html += "<div class=\"card\"><div class=\"card-title\">Detections (Last)</div><div class=\"card-val\">" + String(g_chimeCount) + " (" + g_lastChime + ")</div></div>";
@@ -649,7 +678,7 @@ void setupWebServer() {
             html += "<p style=\"color:var(--sub);padding:16px 0;\">No chime events recorded yet. Waiting for chime sound...</p>";
         } else {
             html += "<table><thead><tr>";
-            html += "<th>#</th><th>Time</th><th>Result</th><th>Reason</th><th>Total</th><th>Ding2 Int</th><th>Ding1 Ch/Amp</th><th>Ding2 Ch/Amp</th><th>Timeline</th>";
+            html += "<th>#</th><th>Date / Time</th><th>Result</th><th>Reason</th><th>Total</th><th>Ding2 Int</th><th>Ding1 Ch/Amp</th><th>Ding2 Ch/Amp</th><th>Timeline</th>";
             html += "</tr></thead><tbody>";
             
             if (g_logMutex && xSemaphoreTake(g_logMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -660,7 +689,7 @@ void setupWebServer() {
                     
                     html += "<tr>";
                     html += "<td>" + String(e.id) + "</td>";
-                    html += "<td>" + String(e.timeStr) + "</td>";
+                    html += "<td style=\"white-space:nowrap;\">" + String(e.datetimeStr) + "</td>";
                     if (strcmp(e.result, "Entrance") == 0) {
                         html += "<td><span class=\"badge badge-ent\">Entrance</span></td>";
                     } else {
@@ -694,7 +723,7 @@ void setupWebServer() {
     webServer.on("/logs.csv", HTTP_GET, []() {
         String csv;
         csv.reserve(4096);
-        csv = "id,uptime_sec,time,result,reason,total_duration_ms,ding1_chunks,dong1_chunks,ding1_max_amp,ding2_interval_ms,ding2_chunks,ding2_max_amp,dong2_detected,max_amp_overall,timeline\r\n";
+        csv = "id,datetime,uptime_sec,result,reason,total_duration_ms,ding1_chunks,dong1_chunks,ding1_max_amp,ding2_interval_ms,ding2_chunks,ding2_max_amp,dong2_detected,max_amp_overall,timeline\r\n";
         
         if (g_logMutex && xSemaphoreTake(g_logMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             size_t count = (g_logCount < MAX_LOG_ENTRIES) ? g_logCount : MAX_LOG_ENTRIES;
@@ -703,8 +732,8 @@ void setupWebServer() {
                 size_t idx = (startIdx + i) % MAX_LOG_ENTRIES;
                 const ChimeLogEntry &e = g_logEntries[idx];
                 csv += String(e.id) + ",";
+                csv += "\"" + String(e.datetimeStr) + "\",";
                 csv += String(e.uptimeSec) + ",";
-                csv += "\"" + String(e.timeStr) + "\",";
                 csv += "\"" + String(e.result) + "\",";
                 csv += "\"" + String(e.reason) + "\",";
                 csv += String(e.totalDurationMs) + ",";
@@ -737,6 +766,7 @@ void setupWebServer() {
                 const ChimeLogEntry &e = g_logEntries[idx];
                 json += "  {\r\n";
                 json += "    \"id\": " + String(e.id) + ",\r\n";
+                json += "    \"datetime\": \"" + String(e.datetimeStr) + "\",\r\n";
                 json += "    \"uptime_sec\": " + String(e.uptimeSec) + ",\r\n";
                 json += "    \"time\": \"" + String(e.timeStr) + "\",\r\n";
                 json += "    \"result\": \"" + String(e.result) + "\",\r\n";
@@ -839,6 +869,11 @@ void setup() {
     if (WiFi.status() == WL_CONNECTED) {
         Serial.println("\n[WiFi] Connected.");
         g_ipAddress = WiFi.localIP().toString();
+
+        // --- NTP時刻同期設定 (JST UTC+9) ---
+        configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY);
+        Serial.printf("[NTP] Time synchronization configured (Primary: %s, Secondary: %s)\n", NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY);
+
         setupWebServer();
     } else {
         Serial.println("\n[WiFi] Timeout.");
