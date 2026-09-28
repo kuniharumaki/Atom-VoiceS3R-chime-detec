@@ -30,7 +30,7 @@
   - `i2sRecordTask` (Core 1, 優先度3): I2S バッファの読み取り
   - `monitorTask` (Core 0, 優先度2): FFT 解析とステートマシン、MQTT 送信フラグの設定
   - `oledDisplayTask` (Core 0, 優先度1): 画面描画
-  - `loop` (Core 1): MQTT のキープアライブとパブリッシュ処理
+  - `loop` (Core 1): MQTT のキープアライブ・パブリッシュ処理、および Web サーバーのクライアント処理
 
 ## 機密情報の管理 (Secrets Management)
 - `src/wifi_config.h` は Wi-Fi の SSID/パスワード および MQTT ブローカーの設定情報を保持するため、`.gitignore` でトラッキングから除外されています。
