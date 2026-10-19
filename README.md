@@ -69,8 +69,8 @@ M5Stack Atom VoiceS3R を使用して、インターホンのチャイム音（�
 
 ## MQTT ペイロード仕様
 
-### チャイム検知 (state)
-チャイムを検知すると、指定した `MQTT_TOPIC` へ以下の JSON が送信されます。
+### チャイム検知・待機ステータス (state)
+チャイムを検知すると、指定した `MQTT_TOPIC` へ以下の JSON が送信されます (`value: 1`)。
 ```json
 {
   "event": "chime_detected",
@@ -80,6 +80,16 @@ M5Stack Atom VoiceS3R を使用して、インターホンのチャイム音（�
 }
 ```
 ※ `type` は `"Genkan"` または `"Entrance"` になります。
+
+また、Home Assistant の再起動等でステータスが「不明」になるのを防ぐため、接続時および **5分に1回** 平常時の待機ステータス (`value: 0`) を定期上書き送信します。チャイム検知後は次回定期送信タイマーがリセットされるため、検知直後の状態が上書きされることはありません。
+```json
+{
+  "event": "idle",
+  "type": "none",
+  "device_id": "atom_voice_intercom",
+  "value": 0
+}
+```
 
 ### 接続ステータス (status)
 デバイスの接続状態を `MQTT_TOPIC_STATUS` へ送信します。
