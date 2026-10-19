@@ -118,6 +118,7 @@ static float g_currentDetectMaxAmp = 0.0f;
 // MQTT送信用フラグ
 static volatile bool g_pendingPublish = false;
 static String g_publishType = "";
+static unsigned long g_lastStatePublishTime = 0;
 
 // オフライン（ネットワーク切断）タイムアウト用
 static unsigned long g_offlineStartTime = 0;
@@ -896,6 +897,16 @@ void setup() {
     Serial.println("System Ready.");
 }
 
+// 待機ステータス（value: 0 / idle）のパブリッシュ
+void publishIdleState() {
+    String payload = "{\"event\":\"idle\",\"type\":\"none\",\"device_id\":\"" + String(DEVICE_ID) + "\",\"value\":0}";
+    if (mqttClient.publish(MQTT_TOPIC, payload.c_str())) {
+        Serial.println("[MQTT] State Published (Idle): " + payload);
+    } else {
+        Serial.println("[MQTT] State Publish Failed!");
+    }
+}
+
 // 非ブロッキングのMQTT再接続処理
 void reconnectMQTT() {
     if (WiFi.status() != WL_CONNECTED) return;
@@ -917,6 +928,9 @@ void reconnectMQTT() {
                 Serial.println("connected");
                 // 接続成功時に Birth Message (online) を Retain true で送信
                 mqttClient.publish(MQTT_TOPIC_STATUS, "online", true);
+                // 初期待機ステータスを送信し、次回定期送信タイマーを更新
+                publishIdleState();
+                g_lastStatePublishTime = millis();
             } else {
                 Serial.print("failed, rc=");
                 Serial.println(mqttClient.state());
@@ -946,6 +960,14 @@ void loop() {
                 } else {
                     Serial.println("[MQTT] Message Publish Failed!");
                 }
+                // チャイム検知直後は定期上書きが重ならないようタイマーをリセット
+                g_lastStatePublishTime = millis();
+            }
+
+            // 検知ステータス (待機状態) の定期上書き送信 (5分=300000ms毎)
+            if (millis() - g_lastStatePublishTime > 300000) {
+                g_lastStatePublishTime = millis();
+                publishIdleState();
             }
 
             // テレメトリー (ハートビート) の定期送信 (5分=300000ms毎)
