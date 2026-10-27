@@ -145,6 +145,7 @@ static int g_consecutiveDong = 0;
 static int g_consecutiveDing2 = 0;
 static int g_missCount = 0;
 static unsigned long g_firstDingTime = 0;
+static unsigned long g_dong1TransitionMs = 0;
 static unsigned long g_ding2StartTime = 0;
 static unsigned long g_dong2WaitStart = 0;
 
@@ -162,9 +163,11 @@ const int MIN_DING2_CHUNKS = 2;       // 2打目Ding継続判定用 (2チャン�
 const int MAX_MISS_TOLERANCE = 4;
 const int MAX_STATE_CHUNKS = 40;      // 約2.5秒のタイムアウト
 
-// ハイブリッド判定用 時間パラメータ (1打目Ding開始からの経過時間ms)
-const unsigned long ENTRANCE_WINDOW_START_MS = 650;      // エントランス第2音の受け付け開始 (1打目Dong余韻スパイク排除)
-const unsigned long ENTRANCE_DECISION_LIMIT_MS = 1350;   // 早期玄関判定リミット (エントランス第2音が来なければ玄関確定)
+// ハイブリッド判定用 時間・テンポパラメータ (1打目Ding開始からの経過時間ms / チャンク数)
+const unsigned long ENTRANCE_WINDOW_START_MS = 650;          // エントランス第2音の受け付け開始 (1打目Dong余韻スパイク排除)
+const unsigned long ENTRANCE_DECISION_LIMIT_MS = 1350;       // 早期玄関判定リミット (エントランス第2音が来なければ確定)
+const int ENTRANCE_MAX_DING1_CHUNKS = 6;                     // エントランス1打目Dingの最大チャンク数 (実測: エントランス=4ch, 玄関=9ch)
+const unsigned long ENTRANCE_MAX_DONG1_TRANSITION_MS = 600;  // エントランス1打目Dong移行時間の最大値 (実測: エントランス≈375ms, 玄関≈847ms)
 
 // ============================================================
 // I2S 録音タスク
@@ -272,7 +275,11 @@ void monitorTask(void *pvParameters) {
             bool isDing = false;
             bool isDong = false;
 
-            if (maxAmp >= AMP_THRESHOLD) {
+            // Ding2待ち・確認状態では低振幅の2打目も拾えるようFFT実行閾値を緩和
+            const bool isWaitingDing2 = (g_detectState == STATE_WAIT_ENTRANCE_DING || g_detectState == STATE_CONFIRMING_DING_2);
+            const float fftAmpGate = isWaitingDing2 ? AMP_THRESHOLD_CONTINUE : AMP_THRESHOLD;
+
+            if (maxAmp >= fftAmpGate) {
                 fft.windowing(FFTWindow::Hamming, FFTDirection::Forward);
                 fft.compute(FFTDirection::Forward);
                 fft.complexToMagnitude();
@@ -309,16 +316,17 @@ void monitorTask(void *pvParameters) {
                 double dongNoiseAvg = dongNoiseSum / 8.0;
 
                 // --- 判定条件 ---
-                // 1. 絶対閾値 (ユーザー指定: 15000.0)
-                double magThreshold = 15000.0;
+                // 1. 絶対閾値 (1打目: 15000.0, 2打目Ding待ち時: 10000.0)
+                double magThreshold = isWaitingDing2 ? 10000.0 : 15000.0;
+                double dingOverDongRatio = isWaitingDing2 ? 1.2 : 1.5; // 2打目は1打目Dong残響を考慮して比率を少し緩和
                 
                 // 2. 局所S/N比 & 排他性
-                // Ding: 絶対値クリア AND 周辺ノイズの2倍以上 AND Dong帯域よりも1.5倍以上大きい
-                if (dingMax > magThreshold && dingMax > dingNoiseAvg * 2.0 && dingMax > dongMax * 1.5) {
+                // Ding: 絶対値クリア AND 周辺ノイズの2倍以上 AND Dong帯域よりも一定倍率以上大きい
+                if (dingMax > magThreshold && dingMax > dingNoiseAvg * 2.0 && dingMax > dongMax * dingOverDongRatio) {
                     isDing = true;
                 }
                 // Dong: 絶対値クリア AND 周辺ノイズの2倍以上 AND Ding帯域よりも1.5倍以上大きい
-                if (dongMax > magThreshold && dongMax > dongNoiseAvg * 2.0 && dongMax > dingMax * 1.5) {
+                if (dongMax > 15000.0 && dongMax > dongNoiseAvg * 2.0 && dongMax > dingMax * 1.5) {
                     isDong = true;
                 }
             } else {
@@ -384,6 +392,7 @@ void monitorTask(void *pvParameters) {
                     if (isDing && g_currentAmp >= AMP_THRESHOLD_START) {
                         g_detectState = STATE_DETECTING_DING_1;
                         g_firstDingTime = millis();
+                        g_dong1TransitionMs = 0;
                         g_ding2StartTime = 0;
                         g_dong2WaitStart = 0;
                         g_consecutiveDing = 1;
@@ -406,6 +415,7 @@ void monitorTask(void *pvParameters) {
                             g_missCount = 0;
                             g_statusText = "Dong 1";
                             unsigned long d1Time = millis() - g_firstDingTime;
+                            g_dong1TransitionMs = d1Time;
                             g_currentTimeline += " -> " + String(d1Time) + "ms:Dong1";
                         } else {
                             // Dingが短すぎた（ノイズ）
@@ -470,9 +480,16 @@ void monitorTask(void *pvParameters) {
                 case STATE_WAIT_ENTRANCE_DING: {
                     unsigned long elapsed = millis() - g_firstDingTime;
 
-                    // 【早期判定】1350ms経過してもエントランス第2音が来なければ玄関確定！
+                    // 【タイムアウト判定】1350ms経過してもエントランス第2音が来なかった場合
                     if (elapsed >= ENTRANCE_DECISION_LIMIT_MS) {
-                        triggerDetection("Genkan", "Timeout: No Ding2 within 1350ms");
+                        // 1打目のテンポが明確に高速(Ding1<=6ch かつ Dong1移行<600ms)ならエントランスと救済判定
+                        if (g_consecutiveDing <= ENTRANCE_MAX_DING1_CHUNKS &&
+                            g_dong1TransitionMs > 0 &&
+                            g_dong1TransitionMs < ENTRANCE_MAX_DONG1_TRANSITION_MS) {
+                            triggerDetection("Entrance", "Fast Ding1 tempo (Ding2 missed)");
+                        } else {
+                            triggerDetection("Genkan", "Timeout: No Ding2 within 1350ms");
+                        }
                         break;
                     }
 
@@ -509,7 +526,13 @@ void monitorTask(void *pvParameters) {
                         g_statusText = "Wait Ding2";
 
                         if (elapsed >= ENTRANCE_DECISION_LIMIT_MS) {
-                            triggerDetection("Genkan", "Timeout: Ding2 was noise spike");
+                            if (g_consecutiveDing <= ENTRANCE_MAX_DING1_CHUNKS &&
+                                g_dong1TransitionMs > 0 &&
+                                g_dong1TransitionMs < ENTRANCE_MAX_DONG1_TRANSITION_MS) {
+                                triggerDetection("Entrance", "Fast Ding1 tempo (Ding2 brief)");
+                            } else {
+                                triggerDetection("Genkan", "Timeout: Ding2 was noise spike");
+                            }
                         }
                     }
                     break;
