@@ -493,12 +493,22 @@ void monitorTask(void *pvParameters) {
                         break;
                     }
 
-                    // 【エントランス候補】時間窓内(>=650ms)でDing2候補を検知
+                    // 【エントランス候補】時間窓内(>=650ms)でDing2を検知
                     if (elapsed >= ENTRANCE_WINDOW_START_MS && isDing && g_currentAmp >= AMP_THRESHOLD_DING2) {
-                        g_detectState = STATE_CONFIRMING_DING_2;
                         g_ding2StartTime = millis();
                         g_consecutiveDing2 = 1;
                         g_ding2MaxAmp = g_currentAmp;
+
+                        // 1打目が高速テンポ(Ding1<=6ch かつ Dong1移行<600ms)ならDing2立ち上がり(1チャンク目)で即確定
+                        if (g_consecutiveDing <= ENTRANCE_MAX_DING1_CHUNKS &&
+                            g_dong1TransitionMs > 0 &&
+                            g_dong1TransitionMs < ENTRANCE_MAX_DONG1_TRANSITION_MS) {
+                            g_currentTimeline += " -> " + String(elapsed) + "ms:Ding2(A:" + String((int)g_currentAmp) + ")";
+                            triggerDetection("Entrance", "Fast Ding1 + Ding2 onset", false);
+                            break;
+                        }
+
+                        g_detectState = STATE_CONFIRMING_DING_2;
                         g_statusText = "Ding 2 Check";
                         g_currentTimeline += " -> " + String(elapsed) + "ms:Ding2?(A:" + String((int)g_currentAmp) + ")";
                     }
