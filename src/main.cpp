@@ -158,8 +158,11 @@ const float AMP_THRESHOLD_START = 15000.0f;
 const float AMP_THRESHOLD_CONTINUE = 8000.0f;
 const float AMP_THRESHOLD_DING2 = 12000.0f;
 
-const int MIN_CHUNKS = 4;             // 1打目判定用 (4チャンク = 約256ms)
+// 1打目判定用 (実測ログでは Entrance Ding1=4ch, Dong1=4ch と閾値ちょうどでマージンが無かったため緩和)
+const int MIN_CHUNKS = 3;             // 1打目Ding最小チャンク数 (3チャンク = 約192ms)
+const int MIN_DONG1_CHUNKS = 2;       // 1打目Dong最小チャンク数 (2チャンク = 約128ms)
 const int MIN_DING2_CHUNKS = 2;       // 2打目Ding継続判定用 (2チャンク = 約130ms)
+const int MIN_ABORT_LOG_DING_CHUNKS = 2; // この長さ以上Ding1が続いた後に途中破棄した場合のみ診断ログに記録
 const int MAX_MISS_TOLERANCE = 4;
 const int MAX_STATE_CHUNKS = 40;      // 約2.5秒のタイムアウト
 
@@ -275,9 +278,11 @@ void monitorTask(void *pvParameters) {
             bool isDing = false;
             bool isDong = false;
 
-            // Ding2待ち・確認状態では低振幅の2打目も拾えるようFFT実行閾値を緩和
+            // シーケンス開始後(IDLE以外)は減衰中の音も拾えるようFFT実行閾値を緩和
+            // (従来は Ding1/Dong1 継続中も 15000 未満でFFTをスキップしており、減衰したDong1を取りこぼして途中破棄されていた)
+            const bool isInSequence = (g_detectState != STATE_IDLE);
             const bool isWaitingDing2 = (g_detectState == STATE_WAIT_ENTRANCE_DING || g_detectState == STATE_CONFIRMING_DING_2);
-            const float fftAmpGate = isWaitingDing2 ? AMP_THRESHOLD_CONTINUE : AMP_THRESHOLD;
+            const float fftAmpGate = isInSequence ? AMP_THRESHOLD_CONTINUE : AMP_THRESHOLD;
 
             if (maxAmp >= fftAmpGate) {
                 fft.windowing(FFTWindow::Hamming, FFTDirection::Forward);
@@ -316,8 +321,8 @@ void monitorTask(void *pvParameters) {
                 double dongNoiseAvg = dongNoiseSum / 8.0;
 
                 // --- 判定条件 ---
-                // 1. 絶対閾値 (1打目: 15000.0, 2打目Ding待ち時: 10000.0)
-                double magThreshold = isWaitingDing2 ? 10000.0 : 15000.0;
+                // 1. 絶対閾値 (シーケンス開始判定: 15000.0, 開始後の継続判定: 10000.0)
+                double magThreshold = isInSequence ? 10000.0 : 15000.0;
                 double dingOverDongRatio = isWaitingDing2 ? 1.2 : 1.5; // 2打目は1打目Dong残響を考慮して比率を少し緩和
                 
                 // 2. 局所S/N比 & 排他性
@@ -326,7 +331,7 @@ void monitorTask(void *pvParameters) {
                     isDing = true;
                 }
                 // Dong: 絶対値クリア AND 周辺ノイズの2倍以上 AND Ding帯域よりも1.5倍以上大きい
-                if (dongMax > 15000.0 && dongMax > dongNoiseAvg * 2.0 && dongMax > dingMax * 1.5) {
+                if (dongMax > magThreshold && dongMax > dongNoiseAvg * 2.0 && dongMax > dingMax * 1.5) {
                     isDong = true;
                 }
             } else {
@@ -384,6 +389,40 @@ void monitorTask(void *pvParameters) {
                 g_detectState = STATE_IDLE;
             };
 
+            // シーケンス途中破棄 (未検知) 時の診断ログ記録
+            // ある程度Ding1が続いた後に破棄された場合のみ "Abort" として記録 (MQTT通知・クールダウンは行わない)
+            auto abortSequence = [&](const char* reason, const char* statusText = "IDLE") {
+                if (g_consecutiveDing >= MIN_ABORT_LOG_DING_CHUNKS) {
+                    unsigned long totalDuration = millis() - g_firstDingTime;
+
+                    ChimeLogEntry entry;
+                    memset(&entry, 0, sizeof(entry));
+                    entry.id = g_logNextId++;
+                    entry.uptimeSec = millis() / 1000;
+                    uint32_t s = entry.uptimeSec;
+                    snprintf(entry.timeStr, sizeof(entry.timeStr), "%02lu:%02lu:%02lu", (s / 3600), (s % 3600) / 60, s % 60);
+                    String dtStr = getFormattedDateTime();
+                    strncpy(entry.datetimeStr, dtStr.c_str(), sizeof(entry.datetimeStr) - 1);
+
+                    Serial.printf("--- SEQUENCE ABORTED: %s (Ding1:%dch Dong1:%dch Amp:%.0f) ---\n",
+                                  reason, g_consecutiveDing, g_consecutiveDong, g_currentAmp);
+
+                    strncpy(entry.result, "Abort", sizeof(entry.result) - 1);
+                    strncpy(entry.reason, reason, sizeof(entry.reason) - 1);
+                    entry.totalDurationMs = totalDuration;
+                    entry.ding1Chunks = g_consecutiveDing;
+                    entry.dong1Chunks = g_consecutiveDong;
+                    entry.ding1MaxAmp = g_ding1MaxAmp;
+                    entry.maxAmpOverall = g_currentDetectMaxAmp;
+
+                    g_currentTimeline += " -> " + String(totalDuration) + "ms:Abort(A:" + String((int)g_currentAmp) + ")";
+                    strncpy(entry.timeline, g_currentTimeline.c_str(), sizeof(entry.timeline) - 1);
+                    addChimeLog(entry);
+                }
+                g_detectState = STATE_IDLE;
+                g_statusText = statusText;
+            };
+
             switch (g_detectState) {
                 case STATE_IDLE:
                     if (millis() - g_lastDetectTime < 3000) {
@@ -419,22 +458,21 @@ void monitorTask(void *pvParameters) {
                             g_currentTimeline += " -> " + String(d1Time) + "ms:Dong1";
                         } else {
                             // Dingが短すぎた（ノイズ）
-                            g_detectState = STATE_IDLE;
-                            g_statusText = "IDLE";
+                            abortSequence("Ding1 too short before Dong1");
                         }
                     } else if (isDing) {
                         g_consecutiveDing++;
                         g_missCount = 0;
                         if (g_currentAmp > g_ding1MaxAmp) g_ding1MaxAmp = g_currentAmp;
                         if (g_consecutiveDing > MAX_STATE_CHUNKS) { // タイムアウト
-                            g_detectState = STATE_IDLE;
-                            g_statusText = "IDLE (Timeout)";
+                            abortSequence("Ding1 timeout (too long)", "IDLE (Timeout)");
                         }
                     } else {
                         g_missCount++;
-                        if (g_missCount > MAX_MISS_TOLERANCE || g_currentAmp < AMP_THRESHOLD_CONTINUE) {
-                            g_detectState = STATE_IDLE;
-                            g_statusText = "IDLE";
+                        if (g_missCount > MAX_MISS_TOLERANCE) {
+                            abortSequence("Ding1: Dong1 not found (miss)");
+                        } else if (g_currentAmp < AMP_THRESHOLD_CONTINUE) {
+                            abortSequence("Ding1: amp dropped before Dong1");
                         }
                     }
                     break;
@@ -445,12 +483,11 @@ void monitorTask(void *pvParameters) {
                         g_consecutiveDong++;
                         g_missCount = 0;
                         if (g_consecutiveDong > MAX_STATE_CHUNKS) {
-                            if (elapsed >= ENTRANCE_WINDOW_START_MS && g_consecutiveDong >= MIN_CHUNKS) {
+                            if (elapsed >= ENTRANCE_WINDOW_START_MS && g_consecutiveDong >= MIN_DONG1_CHUNKS) {
                                 g_detectState = STATE_WAIT_ENTRANCE_DING;
                                 g_statusText = "Wait Ding2";
                             } else {
-                                g_detectState = STATE_IDLE;
-                                g_statusText = "IDLE (Timeout)";
+                                abortSequence("Dong1 timeout (too long)", "IDLE (Timeout)");
                             }
                             break;
                         }
@@ -458,7 +495,7 @@ void monitorTask(void *pvParameters) {
                         g_missCount++;
                     }
 
-                    if (g_consecutiveDong >= MIN_CHUNKS) {
+                    if (g_consecutiveDong >= MIN_DONG1_CHUNKS) {
                         if (elapsed >= ENTRANCE_WINDOW_START_MS) {
                             g_detectState = STATE_WAIT_ENTRANCE_DING;
                             g_statusText = "Wait Ding2";
@@ -469,9 +506,10 @@ void monitorTask(void *pvParameters) {
                             g_missCount = 0;
                         }
                     } else {
-                        if (g_missCount > MAX_MISS_TOLERANCE || g_currentAmp < AMP_THRESHOLD_CONTINUE) {
-                            g_detectState = STATE_IDLE;
-                            g_statusText = "IDLE";
+                        if (g_missCount > MAX_MISS_TOLERANCE) {
+                            abortSequence("Dong1 too short (miss)");
+                        } else if (g_currentAmp < AMP_THRESHOLD_CONTINUE) {
+                            abortSequence("Dong1 too short (amp dropped)");
                         }
                     }
                     break;
@@ -679,6 +717,7 @@ void setupWebServer() {
         html += ".badge { display: inline-block; padding: 2px 7px; border-radius: 4px; font-weight: bold; font-size: 0.75rem; }";
         html += ".badge-ent { background: rgba(16,185,129,0.2); color: #34d399; border: 1px solid rgba(16,185,129,0.4); }";
         html += ".badge-gen { background: rgba(245,158,11,0.2); color: #fbbf24; border: 1px solid rgba(245,158,11,0.4); }";
+        html += ".badge-abt { background: rgba(148,163,184,0.15); color: #94a3b8; border: 1px solid rgba(148,163,184,0.4); }";
         html += ".tl-code { font-family: monospace; font-size: 0.75rem; color: #a5b4fc; background: #0b1120; padding: 3px 6px; border-radius: 4px; display: block; overflow-x: auto; white-space: nowrap; max-width: 280px; }";
         html += "</style></head><body><div class=\"container\">";
         
@@ -726,6 +765,8 @@ void setupWebServer() {
                     html += "<td style=\"white-space:nowrap;\">" + String(e.datetimeStr) + "</td>";
                     if (strcmp(e.result, "Entrance") == 0) {
                         html += "<td><span class=\"badge badge-ent\">Entrance</span></td>";
+                    } else if (strcmp(e.result, "Abort") == 0) {
+                        html += "<td><span class=\"badge badge-abt\">Abort</span></td>";
                     } else {
                         html += "<td><span class=\"badge badge-gen\">Genkan</span></td>";
                     }
